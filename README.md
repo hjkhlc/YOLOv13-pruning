@@ -1,3 +1,3 @@
 # YOLOv13-pruning
 
-some shit for money
+A small pile of shit made for the money.
