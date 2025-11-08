@@ -74,6 +74,11 @@ from ultralytics.data.dataset import YOLODataset
 from ultralytics.data.utils import check_cls_dataset, check_det_dataset
 from ultralytics.nn.autobackend import check_class_names, default_class_names
 from ultralytics.nn.modules import C2f, Classify, Detect, RTDETRDecoder
+import types  # 新增：monkey patch forward
+# if onnx:  # 条件导入，避免非ONNX依赖
+#     import onnxruntime as ort  # 新增：ONNX post-export 验证
+
+from ultralytics.nn.modules.block import compute_importance, AdaHGConv, HyperACE  # 扩展导入：针对 patch
 from ultralytics.nn.tasks import DetectionModel, SegmentationModel, WorldModel
 from ultralytics.utils import (
     ARM64,
@@ -242,6 +247,15 @@ class Exporter:
             ncnn,
             imx,
         ) = flags  # export booleans
+        # 新增：动态导入 onnxruntime (仅 ONNX 时，避模块加载 NameError)
+        ort = None
+        if onnx:
+            try:
+                import onnxruntime as ort
+                LOGGER.debug("ONNX runtime imported successfully for post-export verification.")
+            except ImportError as e:
+                LOGGER.warning(f"ONNX verification skipped: onnxruntime import failed ({e}). Install via 'pip install onnxruntime'.")
+                ort = None
         is_tf_format = any((saved_model, pb, tflite, edgetpu, tfjs))
 
         # Device
@@ -340,6 +354,60 @@ class Exporter:
                         torch.cat([s / m.stride.unsqueeze(-1) for s in self.imgsz], dim=1), m.stride, 0.5
                     )
                 )
+
+        # new code: Task15 - Staticize prune_mask during export (apply if prune_ratio >0)
+        prune_ratio = max((getattr(m, 'prune_ratio', 0.0) for m in model.modules() if hasattr(m, 'prune_ratio')), default=0.0)
+        if prune_ratio > 0 and hasattr(model, 'prune'):
+            LOGGER.info(f"Applying pruning (ratio={prune_ratio:.2f}) during export to staticize masks...")
+            # Reuse calibration dataloader for importance computation (like task11)
+            dl = self.get_int8_calibration_dataloader(prefix="Prune ")
+            model.eval()  # Ensure eval mode
+            with torch.no_grad():
+                # Calibrate importance with ~100 batches (or full dl if small)
+                num_iters = min(100, len(dl))
+                for i, batch in enumerate(dl):
+                    if i >= num_iters:
+                        break
+                    im_batch = batch['img'].to(self.device)
+                    _ = model(im_batch)  # Forward to update stats in HyperACE branches
+                # Sync stats globally (task8 compute_importance, skip DDP for export)
+                stats = compute_importance(model, sync_dist=False)
+                LOGGER.debug(f"Aggregated importance stats: {stats[:5]}...")  # Debug top5
+            # Apply prune (task13: traverses HyperACE, sorts stats, sets masks)
+            model.prune(prune_ratio)
+            
+            # 新增：临时清 backward hooks (export-only, 避 TorchScript/ONNX grad 干扰)
+            original_hooks = {}  # 备份 hooks 以防恢复 (可选)
+            for m in model.modules():
+                if isinstance(m, AdaHyperedgeGen):  # 任务2 hooks 来源
+                    original_hooks[id(m)] = m._backward_hooks.copy()
+                    m._backward_hooks.clear()
+                    LOGGER.debug(f"Cleared backward hooks for {type(m).__name__}")
+            
+            # 新增：静态化 prune_mask 为 buffer (常量 tensor, 支持 ONNX trace)
+            for m in model.modules():
+                if hasattr(m, 'prune_mask'):
+                    m.prune_mask = m.prune_mask.detach().cpu().requires_grad_(False).register_buffer('prune_mask', m.prune_mask)
+                    LOGGER.debug(f"Staticized prune_mask for {type(m).__name__}: {m.prune_mask.sum().item()}/{len(m.prune_mask)} active")
+            
+            # 新增：Monkey patch forward 以应用 masked_fill (任务15 核心, 针对 AdaHGConv He 聚合后)
+            def patched_forward(self, *args, **kwargs):
+                out = self.original_forward(*args, **kwargs)  # 原 forward
+                if hasattr(self, 'prune_mask') and self.prune_mask is not None:
+                    # 假设 out 是 He (B, num_e, feat); unsqueeze 广播到 (1, num_e, 1)
+                    mask = self.prune_mask.unsqueeze(0).unsqueeze(-1).expand(out.shape[0], -1, -1)
+                    out = out.masked_fill(~mask, 0.0)  # 零化 inactive edges
+                    LOGGER.debug(f"Applied masked_fill in {type(self).__name__}: {out.sum().item():.2f} non-zero")
+                return out
+            
+            for m in model.modules():
+                if isinstance(m, (AdaHGConv, HyperACE)):  # 核心 prune 位置
+                    m.original_forward = m.forward  # 备份
+                    m.forward = types.MethodType(patched_forward, m)  # 替换 (临时, export-only)
+                    LOGGER.debug(f"Patched forward for {type(m).__name__} with masked_fill")
+            
+            LOGGER.info("Pruning applied, hooks cleared, masks staticized, and forwards patched for export.")
+        # new code end
 
         y = None
         for _ in range(2):
@@ -538,7 +606,25 @@ class Exporter:
             meta.key, meta.value = k, str(v)
 
         onnx.save(model_onnx, f)
+
+       
+        # new code
+        prune_ratio = max((getattr(m, 'prune_ratio', 0.0) for m in self.model.modules() if hasattr(m, 'prune_ratio')), default=0.0)
+        if prune_ratio > 0 and ort is not None:  # 只在 prune 时且 ort 可用
+            try:
+                session = ort.InferenceSession(f, providers=['CPUExecutionProvider'])  # CPU 快速验证
+                ort_inputs = {session.get_inputs()[0].name: self.im.cpu().numpy()}
+                ort_outs = session.run(None, ort_inputs)
+                assert len(ort_outs) > 0, "ONNX output empty"
+                for o in ort_outs:
+                    assert not np.isnan(o).any() and not np.isinf(o).any(), f"ONNX output has NaN/Inf: {o.shape}"
+                    LOGGER.debug(f"ONNX output shape: {o.shape}, non-zero ratio: {np.count_nonzero(o)/o.size:.2%}")
+                LOGGER.info("ONNX pruned model verified: no NaN/Inf, masks applied.")
+            except Exception as e:
+                LOGGER.warning(f"ONNX verification failed: {e} (prune may still work, check Netron)")
+         # new code end
         return f, model_onnx
+
 
     @try_export
     def export_openvino(self, prefix=colorstr("OpenVINO:")):

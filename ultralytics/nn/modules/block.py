@@ -1974,6 +1974,26 @@ class HyperACE(nn.Module):
             b.adjust_prune(ratio, keep_idx)
         LOGGER.info(f"Pruned {ratio*100:.1f}% hyperedges in HyperACE: {keep_num} kept (orig {orig_num})")
     # new code end
+    # # 新增：物理剪枝支持（任务13扩展）
+    # def physical_prune(self):
+    #     """基于keep_idx物理移除pruned超边子组件（e.g., hgnn.edge_weights）。"""
+    #     if not hasattr(self, 'keep_idx'):  # 若无，从逻辑prune推导
+    #         self.prune_hyperedges(ratio=0.2)  # 确保keep_idx设置
+    #     branches = [self.branch1, self.branch2]
+    #     removed_params = 0
+    #     for b in branches:
+    #         if hasattr(b, 'keep_idx'):  # 假设C3AH有keep_idx属性
+    #             # 示例：移除hgnn中pruned超边的edge_weights/tensor
+    #             if hasattr(b.m.hgnn, 'edge_weights'):  # 假设超图卷积有此属性
+    #                 orig_size = b.m.hgnn.edge_weights.numel()
+    #                 b.m.hgnn.edge_weights = b.m.hgnn.edge_weights[self.keep_idx]  # 切片保留keep_idx
+    #                 removed_params += orig_size - b.m.hgnn.edge_weights.numel()
+    #             # 通用：移除无效子模块（若C3AH有动态层）
+    #             for name, mod in list(b.named_modules()):
+    #                 if 'pruned_edge' in name.lower() and hasattr(mod, 'weight'):  # 匹配pruned组件
+    #                     delattr(b, name.split('.')[-1])
+    #                     LOGGER.debug(f"Physically removed {name} in {b}")
+    #     LOGGER.info(f"Physical prune: removed {removed_params} params in HyperACE")
 
 class DownsampleConv(nn.Module):
     """

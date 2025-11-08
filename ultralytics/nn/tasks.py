@@ -391,7 +391,22 @@ class DetectionModel(BaseModel):
     def init_criterion(self):
         """Initialize the loss criterion for the DetectionModel."""
         return E2EDetectLoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
+    def prune(self, ratio=0.2):
+        """
+        Apply pruning to HyperACE modules in the model based on the given ratio.
 
+        Args:
+            ratio (float): Pruning ratio (default: 0.2), fraction of hyperedges to prune.
+
+        Notes:
+            This method traverses all modules and calls prune_hyperedges on HyperACE instances.
+            Sets self.pruned = True for downstream compatibility (e.g., mAP delta logging in validator).
+        """
+        for m in self.model.modules():
+            if isinstance(m, HyperACE):
+                m.prune_hyperedges(ratio)
+        self.pruned = True
+        LOGGER.info(f"Pruning applied to DetectionModel with ratio={ratio:.2f}")
 
 class OBBModel(DetectionModel):
     """YOLOv8 Oriented Bounding Box (OBB) model."""
